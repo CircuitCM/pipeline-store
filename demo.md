@@ -1,6 +1,6 @@
 # Usage
 
-Pipelines in this library use common notation, such as LangChain or R. However it differs from LangChain and other Pipeline libs through certain flexible differences.
+Pipelines in this library use common notation, as seen in LangChain or R. However it differs from LangChain and other Pipeline libs through certain flexible differences.
 
 ```python
 import json
