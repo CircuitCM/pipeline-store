@@ -10,17 +10,34 @@ import inspect
 
 from pydantic.fields import ModelPrivateAttr
 
-import pipeline._misc as utl
+import pipes._misc as utl
 import os
 
 MAX_DEPTH = os.environ.get("PS_DEPTH", 1000)
 
 
 def pipe_funcdict(*funcs,savesig=True) -> ModelPrivateAttr:
-    """Parse the dictionary to get a basic Pipeline instance, but not the entire dependency chain.
-    
-    By setting savesig=False, inspect will be called for every Step of the pipeline. This might be helpful for some reason
-    however it is especially slow due to repeated inspection.
+    """Build a Pydantic ``PrivateAttr`` mapping used by :class:`Pipeline` to resolve step functions.
+
+    The returned object is intended to be assigned to a ``Pipeline`` subclass attribute named
+    ``_functions`` so instances can look up functions by the stored step name.
+
+    Each entry in ``funcs`` may be either:
+
+    - A callable. The key will be the callable's ``__qualname__``.
+    - A 2-item sequence ``(name, callable)``. The key will be the provided ``name``.
+
+    If ``savesig`` is true, each mapping value is a ``(callable, param_names)`` tuple where
+    ``param_names`` is the ordered set of positional-or-keyword parameter names as returned by
+    ``inspect.signature``. This allows :meth:`Pipeline.__call__` to map positional results and
+    named values onto function parameters without repeatedly inspecting signatures at runtime.
+
+    :param funcs: Callables or ``(name, callable)`` pairs to register.
+    :param savesig:
+        If true, store the callable alongside its positional-or-keyword parameter names. If
+        false, only store the callable, and :meth:`Pipeline.__call__` will inspect the signature
+        each time a step runs.
+    :returns: A Pydantic ``PrivateAttr`` suitable for a ``Pipeline`` ``_functions`` attribute.
     """
     if savesig:
         return PrivateAttr({
@@ -38,6 +55,25 @@ def pipe_funcdict(*funcs,savesig=True) -> ModelPrivateAttr:
 
 
 class Step(BaseModel):
+    """A single pipeline step.
+
+    A step identifies a function to call by name and provides positional and keyword arguments
+    to apply when executing the step.
+
+    The constructor normalizes the function reference:
+
+    - If ``function`` is callable, the stored ``function`` field becomes ``function.__qualname__``.
+    - If ``function`` is a string, it is used as-is.
+    - Any other type raises ``ValueError``.
+
+    The positional arguments are stored on the ``args`` field. Keyword arguments are stored on
+    the ``kwargs`` field. If ``args`` or ``kwargs`` are passed as explicit keys in ``data`` they
+    override ``*args``/``**data``.
+
+    :ivar function: Function name used to look up the callable in ``Pipeline._functions``.
+    :ivar args: Positional arguments to append when the step is executed.
+    :ivar kwargs: Keyword arguments to supply when the step is executed.
+    """
     function: str
     args: list[Any] = []
     kwargs: dict[str, Any] = {}
@@ -60,6 +96,33 @@ class Step(BaseModel):
 
 
 class Pipeline(BaseModel):
+    """A serializable, step-based pipeline executor.
+
+    A pipeline is a list of :class:`Step` objects executed in order. Each step references a
+    callable by name; at runtime the name is resolved via the private ``_functions`` mapping.
+
+    Resolution and argument behavior:
+
+    - ``_functions`` is expected to map step names to either callables, or to
+      ``(callable, param_names)`` tuples as produced by :func:`pipe_funcdict`.
+    - The pipeline call accepts initial positional arguments and "global" keyword values.
+      Positional arguments are applied to the first step, and subsequent steps receive the
+      previous step's result(s) as positional inputs.
+    - Step-local ``kwargs`` are merged with global keyword values, then filtered down to only
+      those parameter names supported by the step function.
+    - Prior to calling each function, argument values are "linked" via :func:`pipes._misc.link`,
+      which resolves callables and awaitables.
+
+    Parsing behavior:
+
+    - :meth:`model_validate` and :meth:`parse_raw` recursively convert nested dicts inside a
+      step's ``args``/``kwargs`` into ``Pipeline`` instances, up to ``MAX_DEPTH``. Dicts that do
+      not validate as pipelines are preserved as dicts.
+
+    :ivar name: Friendly name for the pipeline.
+    :ivar steps: Ordered list of :class:`Step` objects.
+    :cvar MAX_DEPTH: Maximum recursion depth when parsing nested pipelines from dicts.
+    """
     MAX_DEPTH: ClassVar[int] = MAX_DEPTH  # can be overridden as a class or even object extension.
     name: str = "NA"
     steps: list[Step] = []
@@ -87,7 +150,7 @@ class Pipeline(BaseModel):
 
     def __or__(self, other):
         if not isinstance(other, Step):
-            raise ValueError("Only Step instances can be added to the pipeline")
+            raise ValueError("Only Step instances can be added to the pipes")
         self.steps.append(other)
         return self
     
@@ -163,7 +226,28 @@ class Pipeline(BaseModel):
         return self
 
     async def __call__(self, *args, **kwargs):
-        """Nameless args are only evaluated in the first step, kwargs will be shared will all steps and nested pipelines if the function signature supports it."""
+        """Run the pipeline and return the final step result.
+
+        The pipeline is executed step-by-step. For each step, the step function is resolved
+        from ``self._functions`` using the step's stored function name.
+
+        Argument flow:
+
+        - Initial positional ``*args`` apply only to the first step.
+        - Each subsequent step receives the previous step's return value as its positional
+          input. If the previous step returned a tuple, its items are treated as multiple
+          positional inputs; otherwise the single value is used as a single positional input.
+        - The initial keyword values provided to the pipeline are treated as global variables
+          and are merged into each step's keyword inputs (subject to the function signature).
+
+        Before calling each step function, the computed argument values are passed through
+        :func:`pipes._misc.link` so callables/awaitables can be evaluated.
+
+        :param args: Initial positional inputs for the first step.
+        :param kwargs: Global keyword values that may be supplied to each step.
+        :returns: The final step's return value.
+        :raises ValueError: If a step's function name cannot be resolved from ``_functions``.
+        """
         # assume that the results of any function will be merged with args at the front.
         args = list(args)
         glvars = kwargs
@@ -213,6 +297,21 @@ def _hash_fallback(args:Collection):
     return (arg if arg.__getattribute__('__hash__') else None if arg is None else id(arg) for arg in args)
 
 class Cache:
+    """Cache function results by argument identity or hash.
+
+    The :meth:`cache` method returns a decorator that wraps a function and memoizes results in
+    ``self.c_dict``. Cache keys are constructed from:
+
+    - The wrapped function's ``__qualname__``
+    - Positional arguments (hashable values are used directly; non-hashables fall back to
+      ``id(value)``; ``None`` is preserved)
+    - Keyword argument names and values using the same hash/id fallback
+
+    For coroutine functions, the cached value is the in-flight or completed ``Future`` created
+    via ``asyncio.ensure_future`` so concurrent callers share the same work.
+
+    :ivar c_dict: The backing cache dictionary.
+    """
 
     def __init__(self,c_dict:dict=None):
         self.c_dict: dict = c_dict if c_dict is not None else {}

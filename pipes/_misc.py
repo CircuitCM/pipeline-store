@@ -2,8 +2,27 @@ import asyncio as aio
 from collections.abc import Awaitable, Callable
 
 
-#async-util's link but I don't want to make it a dependency for the pipeline's lib.
+#async-util's link but I don't want to make it a dependency for the pipes's lib.
 async def link(*args, return_exceptions=True,sync_wait=True):
+    """Resolve callables/awaitables within a value list and return the realized values.
+
+    Each positional value is treated as follows:
+
+    - If it is a callable, it is called and the return value is used.
+    - If it is an awaitable, it is awaited.
+    - If a callable returns an awaitable, the awaitable is optionally awaited depending
+      on ``sync_wait``.
+
+    The function returns a tuple of values aligned with the input order. Awaitables are
+    awaited concurrently via ``asyncio.gather``.
+
+    :param args: Values to resolve. Each may be a literal, a callable, or an awaitable.
+    :param return_exceptions: Passed through to ``asyncio.gather``.
+    :param sync_wait:
+        If true, a callable that returns an awaitable is always awaited. If false, only
+        callables that are coroutine functions have their returned awaitable awaited.
+    :returns: A tuple of resolved values in the same order as ``args``.
+    """
     todo = {}
     def _prep(i, ar):
         # If it's a callable, evaluate
